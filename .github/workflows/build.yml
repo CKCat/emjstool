@@ -1,0 +1,62 @@
+name: Build and Release
+
+on:
+  push:
+    branches: ["main", "master"]
+    tags:
+      - "v*"
+  pull_request:
+    branches: ["main", "master"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        arch: [x64, x86]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Configure CMake
+        run: cmake -B ${{github.workspace}}/build -A ${{ (matrix.arch == 'x64') && 'x64' || 'Win32' }}
+
+      - name: Build
+        run: cmake --build ${{github.workspace}}/build --config Release
+
+      - name: Archive artifacts
+        shell: pwsh
+        run: |
+          $dllPath = Get-ChildItem -Path "${{github.workspace}}" -Filter "jstool.dll" -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          $zipName = "emjstool-${{ matrix.arch }}.zip"
+          Compress-Archive -Path $dllPath -DestinationPath $zipName
+          Write-Output "ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: emjstool-${{ matrix.arch }}
+          path: emjstool-${{ matrix.arch }}.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            emjstool-x64/emjstool-x64.zip
+            emjstool-x86/emjstool-x86.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

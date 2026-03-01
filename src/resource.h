@@ -1,0 +1,40 @@
+//{{NO_DEPENDENCIES}}
+// Microsoft Visual C++ generated include file.
+// Used Resource.rc
+//
+#define IDS_NAME 101
+#define IDB_ICON_TRUE_SMALL 106
+#define IDB_MENU_FORMAT 110
+#define IDB_MENU_SORT 111
+#define IDB_MENU_MINIFY 112
+#define IDB_MENU_TREE 113
+#define IDB_MENU_OPTIONS 114
+
+#define IDM_JSON_FORMAT 201
+#define IDM_JSON_MINIFY 202
+#define IDM_JSON_SORT 203
+#define IDM_JSON_TREE 204
+#define IDM_OPTIONS 205
+
+#define IDC_TREE_VIEW 301
+#define IDC_REFRESH_BUTTON 302
+
+#define IDD_OPTIONS 400
+#define IDC_RDO_EOL_AUTO 401
+#define IDC_RDO_EOL_WIN 402
+#define IDC_RDO_EOL_UNIX 403
+#define IDC_CHK_MIN_KEEP_COMMENTS 404
+#define IDC_CHK_FORMAT_USE_SPACES 405
+#define IDC_EDT_FORMAT_SPACES 406
+#define IDC_CHK_FORMAT_KEEP_INDENT 407
+
+// Next default values for new objects
+//
+#ifdef APSTUDIO_INVOKED
+#ifndef APSTUDIO_READONLY_SYMBOLS
+#define _APS_NEXT_RESOURCE_VALUE 108
+#define _APS_NEXT_COMMAND_VALUE 40001
+#define _APS_NEXT_CONTROL_VALUE 1001
+#define _APS_NEXT_SYMED_VALUE 101
+#endif
+#endif
