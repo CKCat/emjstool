@@ -5,13 +5,15 @@ project(jstool LANGUAGES C CXX RC)
 add_library(jstool SHARED
     src/jstool.cpp
     src/jstool.h
-    src/etlframe.h
-    src/json.hpp
-    src/plugin.h
-    src/resource.h
-    src/Resource.rc
+    src/include/etlframe.h
+    src/nlohmann/json.hpp
+    src/include/plugin.h
+    src/res/resource.h
+    src/res/Resource.rc
     src/jstool.def
 )
+
+target_include_directories(jstool PRIVATE src src/include src/res src/nlohmann)
 
 # Set Unicode and platform definitions
 target_compile_definitions(jstool PRIVATE
@@ -46,7 +48,7 @@ target_link_libraries(jstool PRIVATE
 # Compiler specific options for MSVC
 if(MSVC)
     # Enable /utf8 for MSVC to prevent warning C4819 (data loss on code page 936)
-    target_compile_options(jstool PRIVATE /utf8)
+    target_compile_options(jstool PRIVATE /utf-8)
 
     # Use static CRT (/MT for release, /MTd for debug) to match vcxproj
     set_property(TARGET jstool PROPERTY 
