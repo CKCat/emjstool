@@ -1,5 +1,8 @@
 #include "jstool.h"
 #include <nlohmann/json.hpp>
+#include <algorithm>
+#include <cctype>
+#include <cwctype>
 #include <Windows.h>
 #include <commctrl.h>
 #include <string>
@@ -25,6 +28,27 @@ struct EmJsonOptions {
   bool formatKeepIndent = false;
 };
 static EmJsonOptions g_options;
+
+// --------------------------------------------------------------------------------
+// 树视图数据结构 (修复 UAF 关键)
+// --------------------------------------------------------------------------------
+struct JsonNodeData {
+  std::string path; // JSON Pointer 路径，例如 "/users/0/name"
+};
+
+// JSON Pointer 转义辅助函数 (参照 RFC 6901)
+std::string EscapeJsonPointer(const std::string &key) {
+  std::string escaped;
+  for (char c : key) {
+    if (c == '~')
+      escaped += "~0";
+    else if (c == '/')
+      escaped += "~1";
+    else
+      escaped += c;
+  }
+  return escaped;
+}
 
 // --------------------------------------------------------------------------------
 // 辅助工具函数
@@ -379,9 +403,16 @@ void ProcessJson(HWND hwnd, int commandId) {
 
 #define IDC_TXT_SEARCH 1002
 static bool DoSearchJson(const json *current, const std::string &keyName,
-                         const std::wstring &query,
-                         std::vector<const json *> &path) {
-  path.push_back(current);
+                          const std::wstring &query,
+                          std::vector<std::string> &path,
+                          const std::string &parentPath) {
+  // 构造当前路径
+  std::string myPath = parentPath;
+  if (!keyName.empty()) {
+    myPath += "/" + EscapeJsonPointer(keyName);
+  }
+
+  path.push_back(myPath);
 
   wchar_t buffer[1024];
   std::wstring wKey = utf8_to_utf16(keyName);
@@ -411,14 +442,14 @@ static bool DoSearchJson(const json *current, const std::string &keyName,
 
   if (current->is_object()) {
     for (auto it = current->begin(); it != current->end(); ++it) {
-      if (DoSearchJson(&it.value(), it.key(), query, path))
+      if (DoSearchJson(&it.value(), it.key(), query, path, myPath))
         return true;
     }
   } else if (current->is_array()) {
     for (size_t i = 0; i < current->size(); ++i) {
       char idx[32];
-      sprintf_s(idx, "[%zu]", i);
-      if (DoSearchJson(&(*current)[i], idx, query, path))
+      sprintf_s(idx, "%zu", i); // 修正为与 UpdateTreeView 一致的路径格式
+      if (DoSearchJson(&(*current)[i], idx, query, path, myPath))
         return true;
     }
   }
@@ -427,36 +458,203 @@ static bool DoSearchJson(const json *current, const std::string &keyName,
   return false;
 }
 
-// 简单的搜索定位函数
-void JumpToKey(HWND hwndView, const std::wstring &key) {
-  if (key.empty() || key == L"JSON")
-    return;
-
-  std::wstring searchKey = key;
-  size_t pos = key.find(L": ");
-  if (pos != std::wstring::npos) {
-    searchKey = key.substr(0, pos);
+// 解码 JSON Pointer 转义字符
+std::string UnescapeJsonPointer(const std::string &path) {
+  std::string unescaped;
+  for (size_t i = 0; i < path.length(); ++i) {
+    if (path[i] == '~' && i + 1 < path.length()) {
+      if (path[i + 1] == '0') {
+        unescaped += '~';
+        i++;
+      } else if (path[i + 1] == '1') {
+        unescaped += '/';
+        i++;
+      } else {
+        unescaped += path[i];
+      }
+    } else {
+      unescaped += path[i];
+    }
   }
-  if (searchKey.empty())
-    return;
+  return unescaped;
+}
 
-  // 在编辑器中查找 "\"key\""
-  std::wstring findTarget = L"\"" + searchKey + L"\"";
-  Editor_FindW(hwndView,
-               FLAG_FIND_CASE | FLAG_FIND_AROUND | FLAG_FIND_NO_PROMPT,
-               findTarget.c_str());
+// 辅助：跳过空白字符
+void SkipWhitespace(const wchar_t*& p) {
+    while (*p && iswspace(*p)) p++;
+}
+
+// 辅助：跳过一个完整的 JSON 值（对象、数组、字符串或基本类型）
+void SkipJsonValue(const wchar_t*& p) {
+    SkipWhitespace(p);
+    if (*p == L'{') {
+        int depth = 1; p++;
+        bool inString = false;
+        while (*p && depth > 0) {
+            if (*p == L'\"' && *(p-1) != L'\\') inString = !inString;
+            else if (!inString) {
+                if (*p == L'{') depth++;
+                else if (*p == L'}') depth--;
+            }
+            p++;
+        }
+    } else if (*p == L'[') {
+        int depth = 1; p++;
+        bool inString = false;
+        while (*p && depth > 0) {
+            if (*p == L'\"' && *(p-1) != L'\\') inString = !inString;
+            else if (!inString) {
+                if (*p == L'[') depth++;
+                else if (*p == L']') depth--;
+            }
+            p++;
+        }
+    } else if (*p == L'\"') {
+        p++;
+        while (*p && (*p != L'\"' || *(p-1) == L'\\')) p++;
+        if (*p == L'\"') p++;
+    } else {
+        while (*p && !iswspace(*p) && *p != L',' && *p != L']' && *p != L'}') p++;
+    }
+}
+
+// 更加精准的层级跳转：流式结构扫描器
+void JumpToPath(HWND hwndView, const std::string &path) {
+  if (path.empty() || path == "/") {
+    POINT_PTR pt = {0, 0};
+    Editor_SetCaretPos(hwndView, 1, &pt);
+    return;
+  }
+
+  // 1. 获取全文 (使用可靠的全选读取方案)
+  POINT_PTR ptOldStart, ptOldEnd;
+  Editor_GetSelStart(hwndView, 1, &ptOldStart);
+  Editor_GetSelEnd(hwndView, 1, &ptOldEnd);
+
+  Editor_ExecCommand(hwndView, EEID_EDIT_SELECT_ALL);
+  UINT_PTR nRequired = Editor_GetSelTextW(hwndView, 0, NULL);
+  std::wstring wText;
+  if (nRequired > 1) {
+    wText.resize(nRequired - 1);
+    Editor_GetSelTextW(hwndView, nRequired, &wText[0]);
+  }
+
+  // 立即还原选择，不影响后续处理
+  Editor_SetCaretPos(hwndView, 1, &ptOldStart);
+  Editor_SetCaretPosEx(hwndView, 1, &ptOldEnd, TRUE);
+
+  if (wText.empty()) return;
+
+  // 2. 解析路径组件
+  std::vector<std::string> components;
+  std::string current;
+  for (size_t i = 1; i < path.length(); ++i) {
+    if (path[i] == '/') {
+      components.push_back(UnescapeJsonPointer(current));
+      current.clear();
+    } else {
+      current += path[i];
+    }
+  }
+  if (!current.empty()) components.push_back(UnescapeJsonPointer(current));
+
+  // 3. 开始结构化扫描
+  const wchar_t* start = wText.c_str();
+  const wchar_t* p = start;
+  const wchar_t* matchStart = p; // 记录最后一个成功匹配项的起始位置
+  
+  for (size_t i = 0; i < components.size(); ++i) {
+    const auto &comp = components[i];
+    SkipWhitespace(p);
+    matchStart = p; 
+
+    bool isIndex = !comp.empty() && std::all_of(comp.begin(), comp.end(), ::isdigit);
+
+    if (isIndex) {
+      if (*p == L'[') {
+        p++; // 跳过 [
+        int targetIdx = std::stoi(comp);
+        for (int k = 0; k < targetIdx; ++k) {
+          SkipJsonValue(p);
+          SkipWhitespace(p);
+          if (*p == L',') p++; // 跳过分隔符
+        }
+        SkipWhitespace(p);
+        matchStart = p; // 将高亮起始点移至数组元素开始处
+        if (i == components.size() - 1) {
+            SkipJsonValue(p); // 如果是最后一个组件，计算该元素的完整结束位置以实现全量高亮
+        }
+      }
+    } else {
+      if (*p == L'{') p++; // 进入对象
+      std::wstring targetKey = L"\"" + utf8_to_utf16(comp) + L"\"";
+      const wchar_t* found = wcsstr(p, targetKey.c_str());
+      if (found) {
+        matchStart = found;
+        p = found + targetKey.length(); // 移动到 Key 之后
+        if (i == components.size() - 1) {
+            // 如果是最后一个 Key，我们只高亮这个 Key，不包含冒号
+        } else {
+            while (*p && *p != L':') p++;
+            if (*p == L':') p++;
+        }
+      } else {
+        break; // 路径不匹配
+      }
+    }
+  }
+
+  // 4. 计算逻辑偏移并跳转（处理起止两个点以实现高亮）
+  size_t startOffset = matchStart - start;
+  size_t endOffset = p - start;
+  
+  POINT_PTR ptStart = {0, 0};
+  POINT_PTR ptEnd = {0, 0};
+  
+  auto OffsetToPoint = [&](size_t offset, POINT_PTR& pt) {
+    pt.y = 0; pt.x = 0;
+    for (size_t i = 0; i < offset; ++i) {
+      if (wText[i] == L'\n') { pt.y++; pt.x = 0; }
+      else if (wText[i] != L'\r') { pt.x++; }
+    }
+  };
+
+  OffsetToPoint(startOffset, ptStart);
+  OffsetToPoint(endOffset, ptEnd);
+
+  // 5. 选中并居中
+  // 第一步：设置锚点（起始位置）
+  Editor_SetCaretPos(hwndView, 1, &ptStart);
+  // 第二步：扩展选择到结束位置，并强制居中滚动
+  // 我们直接调用 SendMessage 以使用复合标志位 (bExtend=TRUE, Flags=POS_SCROLL_CENTER | POS_SCROLL_ALWAYS)
+  SNDMSG(hwndView, EE_SET_CARET_POS, MAKEWPARAM(1, TRUE | POS_SCROLL_CENTER | POS_SCROLL_ALWAYS), (LPARAM)&ptEnd);
+  
+  Editor_Redraw(hwndView, TRUE);
 }
 
 void InsertJsonNode(HWND hTreeView, HTREEITEM hParent, const std::string &key,
-                    const json &val) {
+                    const json &val, const std::string &parentPath) {
   wchar_t buffer[1024];
   std::wstring wKey = utf8_to_utf16(key);
+
+  // 构造当前节点的完整路径 (用于 json_pointer)
+  std::string currentPath = parentPath;
+  if (!key.empty()) {
+    // 处理数组索引：如果是 [n] 格式，路径部分只需数字 n
+    std::string pathPart = key;
+    if (pathPart.length() >= 3 && pathPart.front() == '[' && pathPart.back() == ']') {
+        pathPart = pathPart.substr(1, pathPart.length() - 2);
+    }
+    currentPath += "/" + EscapeJsonPointer(pathPart);
+  }
+
+  JsonNodeData *pData = new JsonNodeData{currentPath};
 
   TVINSERTSTRUCTW tvis = {0};
   tvis.hParent = hParent;
   tvis.hInsertAfter = TVI_LAST;
   tvis.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN;
-  tvis.item.lParam = (LPARAM)&val;
+  tvis.item.lParam = (LPARAM)pData;
 
   if (val.is_object()) {
     StringCchPrintfW(buffer, 1024, L"%s { }",
@@ -493,29 +691,29 @@ void MyCFrame::UpdateTreeView(HWND hwndView) {
   SendMessage(m_hTreeView, WM_SETREDRAW, FALSE, 0);
   TreeView_DeleteAllItems(m_hTreeView);
 
-  // 获取文本
+  // 批量获取文本 (使用全选+获取选择文本，配合 m_bUpdating 守卫防止死循环)
+  if (m_bUpdating) return;
+  m_bUpdating = true;
+
+  POINT_PTR ptSelStart, ptSelEnd;
+  Editor_GetSelStart(hwndView, 1, &ptSelStart);
+  Editor_GetSelEnd(hwndView, 1, &ptSelEnd);
+
+  Editor_ExecCommand(hwndView, EEID_EDIT_SELECT_ALL);
+  UINT_PTR nRequired = Editor_GetSelTextW(hwndView, 0, NULL);
   std::wstring wText;
-
-  // 使用 EmEditor 宏函数获取每一行文本，安全且无需选择文本
-  UINT_PTR nLines = Editor_GetLines(hwndView, 1); // 获取逻辑行数
-  wText.reserve(nLines * 50);                     // 预分配空间
-
-  for (UINT_PTR i = 0; i < nLines; i++) {
-    GET_LINE_INFO gli = {0};
-    gli.yLine = i;
-    gli.flags = 1;                                            // FLAG_LOGICAL
-    UINT_PTR reqSize = Editor_GetLineW(hwndView, &gli, NULL); // 包括 \0 的大小
-    if (reqSize > 0) {
-      std::vector<wchar_t> lineBuf(reqSize + 1, 0);
-      gli.cch = reqSize + 1;
-      if (Editor_GetLineW(hwndView, &gli, lineBuf.data()) > 0) {
-        wText += lineBuf.data(); // 碰到 \0 会自行停止，防止 JSON 解析截断崩溃
-      }
-    }
-    wText += L"\n";
+  if (nRequired > 1) {
+    wText.resize(nRequired - 1);
+    Editor_GetSelTextW(hwndView, nRequired, &wText[0]);
   }
 
-  // 清理多余空行，预防因只有回车导致解析失败（可选）
+  // 还原选择状态
+  Editor_SetCaretPos(hwndView, 1, &ptSelStart);
+  Editor_SetCaretPosEx(hwndView, 1, &ptSelEnd, TRUE);
+
+  m_bUpdating = false;
+
+  // 清理多余空行，预防因只有回车导致解析失败
   while (!wText.empty() && (wText.back() == L'\n' || wText.back() == L'\r')) {
     wText.pop_back();
   }
@@ -540,7 +738,7 @@ void MyCFrame::UpdateTreeView(HWND hwndView) {
           bomOffset > 0 ? utf8Text.substr(bomOffset) : utf8Text);
       m_jsonDoc = json::parse(strictJson, nullptr, false,
                               true); // Parse and store in memory
-      InsertJsonNode(m_hTreeView, TVI_ROOT, "", m_jsonDoc);
+      InsertJsonNode(m_hTreeView, TVI_ROOT, "", m_jsonDoc, "");
 
       HTREEITEM hRoot = TreeView_GetRoot(m_hTreeView);
       if (hRoot)
@@ -788,39 +986,36 @@ void MyCFrame::OnEvents(HWND hwndView, UINT nEvent, LPARAM lParam) {
 
 LRESULT CALLBACK MyCFrame::CustomBarProc(HWND hwnd, UINT uMsg, WPARAM wParam,
                                          LPARAM lParam) {
+#ifdef _WIN64
+  MyCFrame *pFrame = (MyCFrame *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+#else
+  MyCFrame *pFrame = (MyCFrame *)GetWindowLongW(hwnd, GWLP_USERDATA);
+#endif
+
   switch (uMsg) {
 
   case WM_COMMAND: {
     if (LOWORD(wParam) == IDC_REFRESH_BUTTON) {
-#ifdef _WIN64
-      MyCFrame *pFrame = (MyCFrame *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-#else
-      MyCFrame *pFrame = (MyCFrame *)GetWindowLongW(hwnd, GWLP_USERDATA);
-#endif
       if (pFrame && pFrame->m_hWndLastView) {
         pFrame->UpdateTreeView(pFrame->m_hWndLastView);
       }
       return 0;
     }
 
-    if (LOWORD(wParam) == IDC_TXT_SEARCH && HIWORD(wParam) == 1) {
+    // 监听搜索框变更 (EN_CHANGE) 或回车/按钮点击
+    if (LOWORD(wParam) == IDC_TXT_SEARCH && (HIWORD(wParam) == EN_CHANGE || HIWORD(wParam) == 1)) {
       HWND hSearch = (HWND)lParam;
       wchar_t text[256];
       GetWindowTextW(hSearch, text, 256);
       HWND hTree = GetDlgItem(hwnd, IDC_TREE_VIEW);
       if (text[0] != L'\0') {
-#ifdef _WIN64
-        MyCFrame *pFrame = (MyCFrame *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-#else
-        MyCFrame *pFrame = (MyCFrame *)GetWindowLongW(hwnd, GWLP_USERDATA);
-#endif
         if (pFrame && !pFrame->m_jsonDoc.is_null()) {
           std::wstring query = text;
           for (auto &c : query)
             c = towlower(c);
 
-          std::vector<const json *> path;
-          if (DoSearchJson(&pFrame->m_jsonDoc, "", query, path)) {
+          std::vector<std::string> path;
+          if (DoSearchJson(&pFrame->m_jsonDoc, "", query, path, "")) {
             HTREEITEM hItem = TreeView_GetRoot(hTree);
             for (size_t i = 1; i < path.size(); ++i) {
               TreeView_Expand(hTree, hItem, TVE_EXPAND);
@@ -831,7 +1026,8 @@ LRESULT CALLBACK MyCFrame::CustomBarProc(HWND hwnd, UINT uMsg, WPARAM wParam,
                 tvi.hItem = hChild;
                 tvi.mask = TVIF_PARAM;
                 if (TreeView_GetItem(hTree, &tvi)) {
-                  if (tvi.lParam == (LPARAM)path[i]) {
+                  JsonNodeData *pItemData = (JsonNodeData *)tvi.lParam;
+                  if (pItemData && pItemData->path == path[i]) {
                     hNext = hChild;
                     break;
                   }
@@ -893,23 +1089,42 @@ LRESULT CALLBACK MyCFrame::CustomBarProc(HWND hwnd, UINT uMsg, WPARAM wParam,
           HWND hTree = lpnmhdr->hwndFrom;
           // 懒加载展开
           if (!TreeView_GetChild(hTree, hItem)) {
-            const json *pVal = (const json *)pnmtv->itemNew.lParam;
-            if (pVal) {
-              SendMessage(hTree, WM_SETREDRAW, FALSE, 0);
-              if (pVal->is_object()) {
-                for (auto &el : pVal->items()) {
-                  InsertJsonNode(hTree, hItem, el.key(), el.value());
+            TVITEMW tvi = {0};
+            tvi.hItem = hItem;
+            tvi.mask = TVIF_PARAM;
+            TreeView_GetItem(hTree, &tvi);
+            JsonNodeData *pData = (JsonNodeData *)tvi.lParam;
+            if (pFrame && pData) {
+              try {
+                // 通过路径安全获取节点引用
+                const json &val =
+                    pFrame->m_jsonDoc.at(json::json_pointer(pData->path));
+
+                SendMessage(hTree, WM_SETREDRAW, FALSE, 0);
+                if (val.is_object()) {
+                  for (auto &el : val.items()) {
+                    InsertJsonNode(hTree, hItem, el.key(), el.value(),
+                                   pData->path);
+                  }
+                } else if (val.is_array()) {
+                  for (size_t i = 0; i < val.size(); ++i) {
+                    char idx[32];
+                    sprintf_s(idx, "[%zu]", i);
+                    InsertJsonNode(hTree, hItem, idx, val[i], pData->path);
+                  }
                 }
-              } else if (pVal->is_array()) {
-                for (size_t i = 0; i < pVal->size(); ++i) {
-                  char idx[32];
-                  sprintf_s(idx, "[%zu]", i);
-                  InsertJsonNode(hTree, hItem, idx, (*pVal)[i]);
-                }
+                SendMessage(hTree, WM_SETREDRAW, TRUE, 0);
+              } catch (...) {
+                // 路径解析失败（通常不会发生，除非文档中途被外部篡改）
               }
-              SendMessage(hTree, WM_SETREDRAW, TRUE, 0);
             }
           }
+        }
+      } else if (lpnmhdr->code == TVN_DELETEITEMW) {
+        LPNMTREEVIEWW pnmtv = (LPNMTREEVIEWW)lParam;
+        JsonNodeData *pData = (JsonNodeData *)pnmtv->itemOld.lParam;
+        if (pData) {
+          delete pData;
         }
       } else if (lpnmhdr->code == NM_DBLCLK ||
                  lpnmhdr->code == TVN_SELCHANGEDW) {
@@ -919,13 +1134,12 @@ LRESULT CALLBACK MyCFrame::CustomBarProc(HWND hwnd, UINT uMsg, WPARAM wParam,
           TVITEMW tvi = {0};
           wchar_t textBuf[256];
           tvi.hItem = hItem;
-          tvi.mask = TVIF_TEXT;
-          tvi.pszText = textBuf;
-          tvi.cchTextMax = 256;
+          tvi.mask = TVIF_PARAM;
           if (TreeView_GetItem(hTree, &tvi)) {
+            JsonNodeData *pData = (JsonNodeData *)tvi.lParam;
             MyCFrame *pFrame = (MyCFrame *)GetFrame(hwnd);
-            if (pFrame && pFrame->m_hWndLastView) {
-              JumpToKey(pFrame->m_hWndLastView, textBuf);
+            if (pFrame && pFrame->m_hWndLastView && pData) {
+              JumpToPath(pFrame->m_hWndLastView, pData->path);
             }
           }
         }

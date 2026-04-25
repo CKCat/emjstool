@@ -41,7 +41,7 @@ public:
 
   MyCFrame()
       : m_hCustomBar(NULL), m_hTreeView(NULL), m_hSearchBox(NULL),
-        m_hWndLastView(NULL), m_nBarID(0) {}
+        m_hWndLastView(NULL), m_nBarID(0), m_bUpdating(false) {}
 
   void OnCommand(HWND hwnd);
   void OnEvents(HWND hwnd, UINT nEvent, LPARAM lParam);
@@ -89,6 +89,7 @@ private:
   HWND m_hSearchBox;
   HWND m_hWndLastView;
   UINT m_nBarID;
+  bool m_bUpdating;
   nlohmann::json m_jsonDoc;
 
   void ToggleTreeView(HWND hwndView);
