@@ -55,6 +55,14 @@ IDB_MENU_SORT           BITMAP                  "icons\\sort.bmp"
 IDB_MENU_MINIFY         BITMAP                  "icons\\min.bmp"
 IDB_MENU_TREE           BITMAP                  "icons\\view.bmp"
 IDB_MENU_OPTIONS        BITMAP                  "icons\\setting.bmp"
+IDB_MENU_HTML           BITMAP                  "icons\\html.bmp"
+IDB_MENU_HASH           BITMAP                  "icons\\hash.bmp"
+IDB_MENU_TIME           BITMAP                  "icons\\time.bmp"
+IDB_MENU_B64            BITMAP                  "icons\\b64.bmp"
+IDB_MENU_URL            BITMAP                  "icons\\url.bmp"
+IDB_MENU_HEX            BITMAP                  "icons\\hex.bmp"
+IDB_MENU_QP             BITMAP                  "icons\\qp.bmp"
+IDB_MENU_SAML           BITMAP                  "icons\\saml.bmp"
 
 
 /////////////////////////////////////////////////////////////////////////////

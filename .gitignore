@@ -333,3 +333,6 @@ ASALocalRun/
 *.binlog
 
 
+
+build
+.cache

@@ -1,10 +1,12 @@
 #include "jstool.h"
-#include <nlohmann/json.hpp>
+#include "json_utils.h"
+#include "mimetools.h"
+#include <Windows.h>
 #include <algorithm>
 #include <cctype>
-#include <cwctype>
-#include <Windows.h>
 #include <commctrl.h>
+#include <cwctype>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <strsafe.h>
 #include <uxtheme.h>
@@ -84,150 +86,6 @@ void CleanStringW(wchar_t *sz) {
       *sz = L' ';
     sz++;
   }
-}
-
-// --------------------------------------------------------------------------------
-// JSON5 到标准 JSON 转换 (支持裸键、单引号、尾随逗号、并去除注释防崩溃)
-// --------------------------------------------------------------------------------
-std::string ConvertJson5ToJson(const std::string &input) {
-  std::string out;
-  out.reserve(input.size() * 1.2);
-  enum State { NORMAL, DOUBLE_STR, SINGLE_STR, LINE_COMM, BLOCK_COMM };
-  State state = NORMAL;
-
-  for (size_t i = 0; i < input.size(); ++i) {
-    char c = input[i];
-    switch (state) {
-    case NORMAL:
-      if (c == '/' && i + 1 < input.size()) {
-        if (input[i + 1] == '/') {
-          state = LINE_COMM;
-          i++;
-          continue;
-        }
-        if (input[i + 1] == '*') {
-          state = BLOCK_COMM;
-          i++;
-          continue;
-        }
-      }
-      if (c == '"') {
-        state = DOUBLE_STR;
-        out += c;
-        continue;
-      }
-      if (c == '\'') {
-        state = SINGLE_STR;
-        out += '"';
-        continue;
-      }
-
-      if (isalpha((unsigned char)c) || c == '_' || c == '$') {
-        std::string word;
-        size_t j = i;
-        while (j < input.size() && (isalnum((unsigned char)input[j]) ||
-                                    input[j] == '_' || input[j] == '$')) {
-          word += input[j];
-          j++;
-        }
-        size_t k = j;
-        while (k < input.size() && isspace((unsigned char)input[k]))
-          k++;
-        if (k < input.size() && input[k] == ':') {
-          out += '"' + word + '"';
-          i = j - 1;
-          continue;
-        }
-        out += word;
-        i = j - 1;
-        continue;
-      }
-
-      if (c == ',') {
-        size_t j = i + 1;
-        bool trailing = false;
-        while (j < input.size()) {
-          if (isspace((unsigned char)input[j])) {
-            j++;
-            continue;
-          }
-          if (input[j] == '/' && j + 1 < input.size() && input[j + 1] == '/') {
-            while (j < input.size() && input[j] != '\n')
-              j++;
-            continue;
-          }
-          if (input[j] == '/' && j + 1 < input.size() && input[j + 1] == '*') {
-            j += 2;
-            while (j + 1 < input.size() &&
-                   !(input[j] == '*' && input[j + 1] == '/'))
-              j++;
-            j += 2;
-            continue;
-          }
-          if (input[j] == '}' || input[j] == ']') {
-            trailing = true;
-            break;
-          }
-          break;
-        }
-        if (trailing)
-          continue;
-      }
-      out += c;
-      break;
-
-    case DOUBLE_STR:
-      if (c == '\\') {
-        out += c;
-        if (i + 1 < input.size())
-          out += input[++i];
-      } else if (c == '"') {
-        state = NORMAL;
-        out += c;
-      } else
-        out += c;
-      break;
-
-    case SINGLE_STR:
-      if (c == '\\') {
-        if (i + 1 < input.size()) {
-          char next = input[++i];
-          if (next == '\'')
-            out += '\'';
-          else if (next == '"')
-            out += "\\\"";
-          else {
-            out += '\\';
-            out += next;
-          }
-        } else
-          out += '\\';
-      } else if (c == '\'') {
-        state = NORMAL;
-        out += '"';
-      } else if (c == '"') {
-        out += "\\\"";
-      } else
-        out += c;
-      break;
-
-    case LINE_COMM:
-      if (c == '\n') {
-        state = NORMAL;
-        out += '\n';
-      }
-      break;
-
-    case BLOCK_COMM:
-      if (c == '*' && i + 1 < input.size() && input[i + 1] == '/') {
-        state = NORMAL;
-        i++;
-      } else if (c == '\n')
-        out += '\n';
-      break;
-    }
-  }
-  return out;
 }
 
 // --------------------------------------------------------------------------------
@@ -403,9 +261,9 @@ void ProcessJson(HWND hwnd, int commandId) {
 
 #define IDC_TXT_SEARCH 1002
 static bool DoSearchJson(const json *current, const std::string &keyName,
-                          const std::wstring &query,
-                          std::vector<std::string> &path,
-                          const std::string &parentPath) {
+                         const std::wstring &query,
+                         std::vector<std::string> &path,
+                         const std::string &parentPath) {
   // 构造当前路径
   std::string myPath = parentPath;
   if (!keyName.empty()) {
@@ -480,42 +338,54 @@ std::string UnescapeJsonPointer(const std::string &path) {
 }
 
 // 辅助：跳过空白字符
-void SkipWhitespace(const wchar_t*& p) {
-    while (*p && iswspace(*p)) p++;
+void SkipWhitespace(const wchar_t *&p) {
+  while (*p && iswspace(*p))
+    p++;
 }
 
 // 辅助：跳过一个完整的 JSON 值（对象、数组、字符串或基本类型）
-void SkipJsonValue(const wchar_t*& p) {
-    SkipWhitespace(p);
-    if (*p == L'{') {
-        int depth = 1; p++;
-        bool inString = false;
-        while (*p && depth > 0) {
-            if (*p == L'\"' && *(p-1) != L'\\') inString = !inString;
-            else if (!inString) {
-                if (*p == L'{') depth++;
-                else if (*p == L'}') depth--;
-            }
-            p++;
-        }
-    } else if (*p == L'[') {
-        int depth = 1; p++;
-        bool inString = false;
-        while (*p && depth > 0) {
-            if (*p == L'\"' && *(p-1) != L'\\') inString = !inString;
-            else if (!inString) {
-                if (*p == L'[') depth++;
-                else if (*p == L']') depth--;
-            }
-            p++;
-        }
-    } else if (*p == L'\"') {
-        p++;
-        while (*p && (*p != L'\"' || *(p-1) == L'\\')) p++;
-        if (*p == L'\"') p++;
-    } else {
-        while (*p && !iswspace(*p) && *p != L',' && *p != L']' && *p != L'}') p++;
+void SkipJsonValue(const wchar_t *&p) {
+  SkipWhitespace(p);
+  if (*p == L'{') {
+    int depth = 1;
+    p++;
+    bool inString = false;
+    while (*p && depth > 0) {
+      if (*p == L'\"' && *(p - 1) != L'\\')
+        inString = !inString;
+      else if (!inString) {
+        if (*p == L'{')
+          depth++;
+        else if (*p == L'}')
+          depth--;
+      }
+      p++;
     }
+  } else if (*p == L'[') {
+    int depth = 1;
+    p++;
+    bool inString = false;
+    while (*p && depth > 0) {
+      if (*p == L'\"' && *(p - 1) != L'\\')
+        inString = !inString;
+      else if (!inString) {
+        if (*p == L'[')
+          depth++;
+        else if (*p == L']')
+          depth--;
+      }
+      p++;
+    }
+  } else if (*p == L'\"') {
+    p++;
+    while (*p && (*p != L'\"' || *(p - 1) == L'\\'))
+      p++;
+    if (*p == L'\"')
+      p++;
+  } else {
+    while (*p && !iswspace(*p) && *p != L',' && *p != L']' && *p != L'}')
+      p++;
+  }
 }
 
 // 更加精准的层级跳转：流式结构扫描器
@@ -543,7 +413,8 @@ void JumpToPath(HWND hwndView, const std::string &path) {
   Editor_SetCaretPos(hwndView, 1, &ptOldStart);
   Editor_SetCaretPosEx(hwndView, 1, &ptOldEnd, TRUE);
 
-  if (wText.empty()) return;
+  if (wText.empty())
+    return;
 
   // 2. 解析路径组件
   std::vector<std::string> components;
@@ -556,19 +427,21 @@ void JumpToPath(HWND hwndView, const std::string &path) {
       current += path[i];
     }
   }
-  if (!current.empty()) components.push_back(UnescapeJsonPointer(current));
+  if (!current.empty())
+    components.push_back(UnescapeJsonPointer(current));
 
   // 3. 开始结构化扫描
-  const wchar_t* start = wText.c_str();
-  const wchar_t* p = start;
-  const wchar_t* matchStart = p; // 记录最后一个成功匹配项的起始位置
-  
+  const wchar_t *start = wText.c_str();
+  const wchar_t *p = start;
+  const wchar_t *matchStart = p; // 记录最后一个成功匹配项的起始位置
+
   for (size_t i = 0; i < components.size(); ++i) {
     const auto &comp = components[i];
     SkipWhitespace(p);
-    matchStart = p; 
+    matchStart = p;
 
-    bool isIndex = !comp.empty() && std::all_of(comp.begin(), comp.end(), ::isdigit);
+    bool isIndex =
+        !comp.empty() && std::all_of(comp.begin(), comp.end(), ::isdigit);
 
     if (isIndex) {
       if (*p == L'[') {
@@ -577,26 +450,31 @@ void JumpToPath(HWND hwndView, const std::string &path) {
         for (int k = 0; k < targetIdx; ++k) {
           SkipJsonValue(p);
           SkipWhitespace(p);
-          if (*p == L',') p++; // 跳过分隔符
+          if (*p == L',')
+            p++; // 跳过分隔符
         }
         SkipWhitespace(p);
         matchStart = p; // 将高亮起始点移至数组元素开始处
         if (i == components.size() - 1) {
-            SkipJsonValue(p); // 如果是最后一个组件，计算该元素的完整结束位置以实现全量高亮
+          SkipJsonValue(
+              p); // 如果是最后一个组件，计算该元素的完整结束位置以实现全量高亮
         }
       }
     } else {
-      if (*p == L'{') p++; // 进入对象
+      if (*p == L'{')
+        p++; // 进入对象
       std::wstring targetKey = L"\"" + utf8_to_utf16(comp) + L"\"";
-      const wchar_t* found = wcsstr(p, targetKey.c_str());
+      const wchar_t *found = wcsstr(p, targetKey.c_str());
       if (found) {
         matchStart = found;
         p = found + targetKey.length(); // 移动到 Key 之后
         if (i == components.size() - 1) {
-            // 如果是最后一个 Key，我们只高亮这个 Key，不包含冒号
+          // 如果是最后一个 Key，我们只高亮这个 Key，不包含冒号
         } else {
-            while (*p && *p != L':') p++;
-            if (*p == L':') p++;
+          while (*p && *p != L':')
+            p++;
+          if (*p == L':')
+            p++;
         }
       } else {
         break; // 路径不匹配
@@ -607,15 +485,20 @@ void JumpToPath(HWND hwndView, const std::string &path) {
   // 4. 计算逻辑偏移并跳转（处理起止两个点以实现高亮）
   size_t startOffset = matchStart - start;
   size_t endOffset = p - start;
-  
+
   POINT_PTR ptStart = {0, 0};
   POINT_PTR ptEnd = {0, 0};
-  
-  auto OffsetToPoint = [&](size_t offset, POINT_PTR& pt) {
-    pt.y = 0; pt.x = 0;
-    for (size_t i = 0; i < offset; ++i) {
-      if (wText[i] == L'\n') { pt.y++; pt.x = 0; }
-      else if (wText[i] != L'\r') { pt.x++; }
+
+  auto OffsetToPoint = [&](size_t offset, POINT_PTR &pt) {
+    pt.y = 0;
+    pt.x = 0;
+    for (size_t k = 0; k < offset; ++k) {
+      if (wText[k] == L'\n') {
+        pt.y++;
+        pt.x = 0;
+      } else if (wText[k] != L'\r') {
+        pt.x++;
+      }
     }
   };
 
@@ -626,9 +509,12 @@ void JumpToPath(HWND hwndView, const std::string &path) {
   // 第一步：设置锚点（起始位置）
   Editor_SetCaretPos(hwndView, 1, &ptStart);
   // 第二步：扩展选择到结束位置，并强制居中滚动
-  // 我们直接调用 SendMessage 以使用复合标志位 (bExtend=TRUE, Flags=POS_SCROLL_CENTER | POS_SCROLL_ALWAYS)
-  SNDMSG(hwndView, EE_SET_CARET_POS, MAKEWPARAM(1, TRUE | POS_SCROLL_CENTER | POS_SCROLL_ALWAYS), (LPARAM)&ptEnd);
-  
+  // 我们直接调用 SendMessage 以使用复合标志位 (bExtend=TRUE,
+  // Flags=POS_SCROLL_CENTER | POS_SCROLL_ALWAYS)
+  SNDMSG(hwndView, EE_SET_CARET_POS,
+         MAKEWPARAM(1, TRUE | POS_SCROLL_CENTER | POS_SCROLL_ALWAYS),
+         (LPARAM)&ptEnd);
+
   Editor_Redraw(hwndView, TRUE);
 }
 
@@ -642,8 +528,9 @@ void InsertJsonNode(HWND hTreeView, HTREEITEM hParent, const std::string &key,
   if (!key.empty()) {
     // 处理数组索引：如果是 [n] 格式，路径部分只需数字 n
     std::string pathPart = key;
-    if (pathPart.length() >= 3 && pathPart.front() == '[' && pathPart.back() == ']') {
-        pathPart = pathPart.substr(1, pathPart.length() - 2);
+    if (pathPart.length() >= 3 && pathPart.front() == '[' &&
+        pathPart.back() == ']') {
+      pathPart = pathPart.substr(1, pathPart.length() - 2);
     }
     currentPath += "/" + EscapeJsonPointer(pathPart);
   }
@@ -692,7 +579,8 @@ void MyCFrame::UpdateTreeView(HWND hwndView) {
   TreeView_DeleteAllItems(m_hTreeView);
 
   // 批量获取文本 (使用全选+获取选择文本，配合 m_bUpdating 守卫防止死循环)
-  if (m_bUpdating) return;
+  if (m_bUpdating)
+    return;
   m_bUpdating = true;
 
   POINT_PTR ptSelStart, ptSelEnd;
@@ -928,9 +816,42 @@ void MyCFrame::OnCommand(HWND hwndView) {
   AppendMenuW(hMenu, MF_STRING, IDM_JSON_FORMAT, L"JSFormat");
   AppendMenuW(hMenu, MF_STRING, IDM_JSON_SORT, L"JSSort");
   AppendMenuW(hMenu, MF_STRING, IDM_JSON_MINIFY, L"JSMin");
-  AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(hMenu, MF_STRING, IDM_JSON_TREE, L"JSON TreeView");
   AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+
+  // Mime Tools Submenu
+  HMENU hMimeMenu = CreatePopupMenu();
+  AppendMenuW(hMimeMenu, MF_STRING, IDM_B64_ENCODE, L"Base64 Encode");
+  AppendMenuW(hMimeMenu, MF_STRING, IDM_B64_DECODE, L"Base64 Decode");
+  AppendMenuW(hMimeMenu, MF_SEPARATOR, 0, NULL);
+  AppendMenuW(hMimeMenu, MF_STRING, IDM_URL_ENCODE, L"URL Encode");
+  AppendMenuW(hMimeMenu, MF_STRING, IDM_URL_DECODE, L"URL Decode");
+  AppendMenuW(hMimeMenu, MF_SEPARATOR, 0, NULL);
+  AppendMenuW(hMimeMenu, MF_STRING, IDM_HEX_ENCODE, L"Hex Encode");
+  AppendMenuW(hMimeMenu, MF_STRING, IDM_HEX_DECODE, L"Hex Decode");
+  AppendMenuW(hMimeMenu, MF_SEPARATOR, 0, NULL);
+  AppendMenuW(hMimeMenu, MF_STRING, IDM_HTML_ENCODE, L"HTML Encode");
+  AppendMenuW(hMimeMenu, MF_STRING, IDM_HTML_DECODE, L"HTML Decode");
+  AppendMenuW(hMimeMenu, MF_SEPARATOR, 0, NULL);
+  AppendMenuW(hMimeMenu, MF_STRING, IDM_QP_ENCODE, L"QP Encode");
+  AppendMenuW(hMimeMenu, MF_STRING, IDM_QP_DECODE, L"QP Decode");
+  AppendMenuW(hMimeMenu, MF_SEPARATOR, 0, NULL);
+  AppendMenuW(hMimeMenu, MF_STRING, IDM_SAML_DECODE, L"SAML Decode");
+  AppendMenuW(hMimeMenu, MF_SEPARATOR, 0, NULL);
+  AppendMenuW(hMimeMenu, MF_STRING, IDM_TIMESTAMP, L"Timestamp / Date");
+
+  // Hash Submenu
+  HMENU hHashMenu = CreatePopupMenu();
+  AppendMenuW(hHashMenu, MF_STRING, IDM_MD5, L"MD5");
+  AppendMenuW(hHashMenu, MF_STRING, IDM_SHA1, L"SHA-1");
+  AppendMenuW(hHashMenu, MF_STRING, IDM_SHA256, L"SHA-256");
+  AppendMenuW(hHashMenu, MF_STRING, IDM_SHA512, L"SHA-512");
+  AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hHashMenu, L"Hash");
+  AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+
+  AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hMimeMenu, L"Mime Tools");
+  AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+
   AppendMenuW(hMenu, MF_STRING, IDM_OPTIONS, L"Options");
 
   HBITMAP hBmpFormat =
@@ -943,14 +864,64 @@ void MyCFrame::OnCommand(HWND hwndView) {
       LoadBitmapW(EEGetInstanceHandle(), MAKEINTRESOURCEW(IDB_MENU_TREE));
   HBITMAP hBmpOptions =
       LoadBitmapW(EEGetInstanceHandle(), MAKEINTRESOURCEW(IDB_MENU_OPTIONS));
+  HBITMAP hBmpHtml =
+      LoadBitmapW(EEGetInstanceHandle(), MAKEINTRESOURCEW(IDB_MENU_HTML));
+  HBITMAP hBmpHash =
+      LoadBitmapW(EEGetInstanceHandle(), MAKEINTRESOURCEW(IDB_MENU_HASH));
+  HBITMAP hBmpTime =
+      LoadBitmapW(EEGetInstanceHandle(), MAKEINTRESOURCEW(IDB_MENU_TIME));
+  HBITMAP hBmpB64 =
+      LoadBitmapW(EEGetInstanceHandle(), MAKEINTRESOURCEW(IDB_MENU_B64));
+  HBITMAP hBmpUrl =
+      LoadBitmapW(EEGetInstanceHandle(), MAKEINTRESOURCEW(IDB_MENU_URL));
+  HBITMAP hBmpHex =
+      LoadBitmapW(EEGetInstanceHandle(), MAKEINTRESOURCEW(IDB_MENU_HEX));
+  HBITMAP hBmpQP =
+      LoadBitmapW(EEGetInstanceHandle(), MAKEINTRESOURCEW(IDB_MENU_QP));
+  HBITMAP hBmpSaml =
+      LoadBitmapW(EEGetInstanceHandle(), MAKEINTRESOURCEW(IDB_MENU_SAML));
 
-  SetMenuItemBitmaps(hMenu, IDM_JSON_FORMAT, MF_BYCOMMAND, hBmpFormat,
-                     hBmpFormat);
-  SetMenuItemBitmaps(hMenu, IDM_JSON_SORT, MF_BYCOMMAND, hBmpSort, hBmpSort);
-  SetMenuItemBitmaps(hMenu, IDM_JSON_MINIFY, MF_BYCOMMAND, hBmpMin, hBmpMin);
-  SetMenuItemBitmaps(hMenu, IDM_JSON_TREE, MF_BYCOMMAND, hBmpTree, hBmpTree);
-  SetMenuItemBitmaps(hMenu, IDM_OPTIONS, MF_BYCOMMAND, hBmpOptions,
-                     hBmpOptions);
+  // 辅助函数：为菜单项设置图标 (支持命令和子菜单)
+  auto SetIcon = [](HMENU hTargetMenu, UINT_PTR idOrSubmenu, HBITMAP hBmp, bool byPos = false) {
+    MENUITEMINFOW mii = {sizeof(mii)};
+    mii.fMask = MIIM_BITMAP;
+    mii.hbmpItem = hBmp;
+    SetMenuItemInfoW(hTargetMenu, (UINT)idOrSubmenu, byPos ? TRUE : FALSE, &mii);
+  };
+
+  // 主菜单图标
+  SetIcon(hMenu, IDM_JSON_FORMAT, hBmpFormat);
+  SetIcon(hMenu, IDM_JSON_SORT, hBmpSort);
+  SetIcon(hMenu, IDM_JSON_MINIFY, hBmpMin);
+  SetIcon(hMenu, IDM_JSON_TREE, hBmpTree);
+
+  // Hash 根项 (hMenu 中的第 5 项，索引从 0 开始)
+  SetIcon(hMenu, 5, hBmpHash, true);
+
+  // Mime Tools 根项 (hMenu 中的第 7 项)
+  SetIcon(hMenu, 7, hBmpHtml, true);
+
+  SetIcon(hMenu, IDM_OPTIONS, hBmpOptions);
+
+  // Mime Tools 子项
+  SetIcon(hMimeMenu, IDM_B64_ENCODE, hBmpB64);
+  SetIcon(hMimeMenu, IDM_B64_DECODE, hBmpB64);
+  SetIcon(hMimeMenu, IDM_URL_ENCODE, hBmpUrl);
+  SetIcon(hMimeMenu, IDM_URL_DECODE, hBmpUrl);
+  SetIcon(hMimeMenu, IDM_HEX_ENCODE, hBmpHex);
+  SetIcon(hMimeMenu, IDM_HEX_DECODE, hBmpHex);
+  SetIcon(hMimeMenu, IDM_HTML_ENCODE, hBmpHtml);
+  SetIcon(hMimeMenu, IDM_HTML_DECODE, hBmpHtml);
+  SetIcon(hMimeMenu, IDM_QP_ENCODE, hBmpQP);
+  SetIcon(hMimeMenu, IDM_QP_DECODE, hBmpQP);
+  SetIcon(hMimeMenu, IDM_SAML_DECODE, hBmpSaml);
+  SetIcon(hMimeMenu, IDM_TIMESTAMP, hBmpTime);
+
+  // Hash 子项 (Hash 现在直接挂在主菜单下)
+  SetIcon(hHashMenu, IDM_MD5, hBmpHash);
+  SetIcon(hHashMenu, IDM_SHA1, hBmpHash);
+  SetIcon(hHashMenu, IDM_SHA256, hBmpHash);
+  SetIcon(hHashMenu, IDM_SHA512, hBmpHash);
 
   POINT pt;
   GetCursorPos(&pt);
@@ -969,12 +940,60 @@ void MyCFrame::OnCommand(HWND hwndView) {
     DeleteObject(hBmpTree);
   if (hBmpOptions)
     DeleteObject(hBmpOptions);
+  if (hBmpHtml)
+    DeleteObject(hBmpHtml);
+  if (hBmpHash)
+    DeleteObject(hBmpHash);
+  if (hBmpTime)
+    DeleteObject(hBmpTime);
+  if (hBmpB64)
+    DeleteObject(hBmpB64);
+  if (hBmpUrl)
+    DeleteObject(hBmpUrl);
+  if (hBmpHex)
+    DeleteObject(hBmpHex);
+  if (hBmpQP)
+    DeleteObject(hBmpQP);
+  if (hBmpSaml)
+    DeleteObject(hBmpSaml);
 
   if (selId == IDM_JSON_TREE)
     ToggleTreeView(hwndView);
   else if (selId == IDM_OPTIONS)
     DialogBoxParamW(EEGetInstanceHandle(), MAKEINTRESOURCEW(IDD_OPTIONS),
                     hwndView, OptionsDlgProc, 0);
+  else if (selId == IDM_B64_ENCODE)
+    MimeTools::EncodeBase64(hwndView);
+  else if (selId == IDM_B64_DECODE)
+    MimeTools::DecodeBase64(hwndView);
+  else if (selId == IDM_URL_ENCODE)
+    MimeTools::EncodeUrl(hwndView);
+  else if (selId == IDM_URL_DECODE)
+    MimeTools::DecodeUrl(hwndView);
+  else if (selId == IDM_HEX_ENCODE)
+    MimeTools::EncodeHex(hwndView);
+  else if (selId == IDM_HEX_DECODE)
+    MimeTools::DecodeHex(hwndView);
+  else if (selId == IDM_SAML_DECODE)
+    MimeTools::DecodeSaml(hwndView);
+  else if (selId == IDM_HTML_ENCODE)
+    MimeTools::EncodeHtml(hwndView);
+  else if (selId == IDM_HTML_DECODE)
+    MimeTools::DecodeHtml(hwndView);
+  else if (selId == IDM_QP_ENCODE)
+    MimeTools::EncodeQP(hwndView);
+  else if (selId == IDM_QP_DECODE)
+    MimeTools::DecodeQP(hwndView);
+  else if (selId == IDM_MD5)
+    MimeTools::HashMD5(hwndView);
+  else if (selId == IDM_SHA1)
+    MimeTools::HashSHA1(hwndView);
+  else if (selId == IDM_SHA256)
+    MimeTools::HashSHA256(hwndView);
+  else if (selId == IDM_SHA512)
+    MimeTools::HashSHA512(hwndView);
+  else if (selId == IDM_TIMESTAMP)
+    MimeTools::ConvertTimestamp(hwndView);
   else if (selId > 0)
     ProcessJson(hwndView, selId);
 }
@@ -1003,7 +1022,8 @@ LRESULT CALLBACK MyCFrame::CustomBarProc(HWND hwnd, UINT uMsg, WPARAM wParam,
     }
 
     // 监听搜索框变更 (EN_CHANGE) 或回车/按钮点击
-    if (LOWORD(wParam) == IDC_TXT_SEARCH && (HIWORD(wParam) == EN_CHANGE || HIWORD(wParam) == 1)) {
+    if (LOWORD(wParam) == IDC_TXT_SEARCH &&
+        (HIWORD(wParam) == EN_CHANGE || HIWORD(wParam) == 1)) {
       HWND hSearch = (HWND)lParam;
       wchar_t text[256];
       GetWindowTextW(hSearch, text, 256);
