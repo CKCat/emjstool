@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.15)
+cmake_policy(SET CMP0135 NEW)
 project(jstool LANGUAGES C CXX RC)
+
+# Compiler specific options for MSVC
+if(MSVC)
+    # Enable /utf8 for MSVC to prevent warning C4819 (data loss on code page 936)
+    add_compile_options(/utf-8)
+endif()
+
 
 # EmEditor Plugin requires building a DLL
 add_library(jstool SHARED
@@ -36,15 +44,27 @@ FetchContent_MakeAvailable(googletest)
 
 enable_testing()
 
-add_executable(mimetools_test tests/mimetools_test.cpp src/mimetools.cpp src/tinflate.c)
+add_executable(mimetools_test 
+    tests/mimetools_test.cpp 
+    src/mimetools.cpp 
+    src/tinflate.c
+    src/hash_utils.cpp
+    src/time_utils.cpp
+)
 target_include_directories(mimetools_test PRIVATE src)
 # Define dummy HWND/BOOL etc for mimetools.cpp in non-windows test environment if needed, 
 # but here we are on Windows so we just link user32
-target_link_libraries(mimetools_test GTest::gtest_main user32)
+target_link_libraries(mimetools_test GTest::gtest_main user32 bcrypt)
 
-add_executable(htmltools_test tests/htmltools_test.cpp src/mimetools.cpp src/tinflate.c)
+add_executable(htmltools_test 
+    tests/htmltools_test.cpp 
+    src/mimetools.cpp 
+    src/tinflate.c
+    src/hash_utils.cpp
+    src/time_utils.cpp
+)
 target_include_directories(htmltools_test PRIVATE src)
-target_link_libraries(htmltools_test GTest::gtest_main user32)
+target_link_libraries(htmltools_test GTest::gtest_main user32 bcrypt)
 
 add_executable(json_robustness_test tests/json_robustness_test.cpp src/json_utils.cpp)
 target_include_directories(json_robustness_test PRIVATE src)
@@ -97,9 +117,6 @@ target_link_libraries(jstool PRIVATE
 
 # Compiler specific options for MSVC
 if(MSVC)
-    # Enable /utf8 for MSVC to prevent warning C4819 (data loss on code page 936)
-    target_compile_options(jstool PRIVATE /utf-8)
-
     # Use static CRT (/MT for release, /MTd for debug) to match vcxproj
     set_property(TARGET jstool PROPERTY 
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
